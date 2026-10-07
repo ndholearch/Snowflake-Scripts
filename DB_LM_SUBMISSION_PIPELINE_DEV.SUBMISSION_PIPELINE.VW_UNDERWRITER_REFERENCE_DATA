@@ -1,0 +1,30 @@
+create or replace view DB_LM_SUBMISSION_PIPELINE_DEV.SUBMISSION_PIPELINE.VW_UNDERWRITER_REFERENCE_DATA(
+	"Key",
+	"ShortDescription",
+	"Description",
+	"DepartmentCode",
+	"LicSecondee",
+	"IsDeleted"
+) as
+
+ SELECT TRIM(OKPUCD) AS "Key",
+        TRIM(OKUWNM) AS "ShortDescription",
+        CASE
+        WHEN TRIM(OKUWTX) = '' THEN TRIM(OKPUCD)
+        ELSE TRIM(OKUWTX)
+        END AS "Description",
+        TRIM(OKDPCD) AS "DepartmentCode",
+        CASE
+        WHEN TRIM(OKPUCD) IN ('JMM','JOW','MD','MXC','SOG') THEN TRUE
+        ELSE FALSE
+        END AS "LicSecondee",
+        CASE
+        WHEN X.OKRCFD != 'D' THEN FALSE
+        ELSE TRUE
+        END AS "IsDeleted"
+        
+   FROM "PROD_IRIS_A_RAW"."XUNMDTAAIE".UCOKREP AS X
+
+  WHERE X.OKPUFD IN ('U') 
+        AND NOT STARTSWITH(TRIM(OKPUCD), 'Q')
+        AND X.OKRCFD != 'D';

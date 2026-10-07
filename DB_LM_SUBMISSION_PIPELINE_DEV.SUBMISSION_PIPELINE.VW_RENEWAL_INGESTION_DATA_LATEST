@@ -1,0 +1,299 @@
+create or replace view DB_LM_SUBMISSION_PIPELINE_DEV.SUBMISSION_PIPELINE.VW_RENEWAL_INGESTION_DATA_LATEST(
+	VIEW_TYPE,
+	UNIQUERENEWALGROUPKEY,
+	RENEWALGROUPID,
+	LINEOFBUSINESSGROUP,
+	UNDERWRITINGGROUP,
+	RISKREFERENCE,
+	RISKREF_LOWEST,
+	UMRCOUNT,
+	UMR,
+	MARKET,
+	UNDERLYING_RECORD_COUNT,
+	LINEOFBUSINESS,
+	ASSUREDDESCRIPTION,
+	ASSUREDDOMICILE,
+	CLASS,
+	SUBCLASS,
+	TRADECODEDESCRIPTION,
+	INCEPTIONDATE,
+	EXPIRYDATE,
+	RENEWABLEINDICATOR,
+	TOPBROKER,
+	UNDERWRITER,
+	FACILITYTYPE,
+	LEADFOLLOW,
+	SHARESIZE,
+	SLIPLEADER,
+	TERRITORYDESCRIPTION,
+	OURSHAREGROSSWRITTENPREMIUM,
+	EXPECTEDLOSSRATIOPERCENT,
+	LLOYDSBENCHMARKPERCENT,
+	ROCBENCHMARKPERCENT
+) as
+
+
+with cte_exchange_rate as (
+    select
+        fromcurrencyid,
+        to_number(reportingperiod) as reportingperiod,
+        exchangerate as rate_usd
+    from DB_Data_Analytics_DEV.ED_DW.FACT_EXCHANGE_RATES fx
+    join DB_Data_Analytics_DEV.ED_DW.DIM_EXCHANGE_RATE_TYPE rt
+        on rt.exchangeratetypeid = fx.exchangeratetypeid
+    join DB_Data_Analytics_DEV.ED_DW.DIM_CURRENCY tcur
+        on tcur.currencyid = fx.tocurrencyid
+    where fx.reportingperiod <> 'CURRENT'
+      and rt.exchangeratetype = 'Quarterly (Transaction)'
+      and tcur.currencycode = 'USD'
+),
+
+
+cte_exchange_rate_current as (
+select
+    fromcurrencyid,
+    fromcurrencyid      as originalcurrencyid,
+    tocurrencyid        as accountingcurrencyid,
+    tcur.currencycode   as tocurrencycode,
+    exchangerate        as financialcurrentroe,
+    exchangerate
+from DB_Data_Analytics_DEV.ED_DW.FACT_EXCHANGE_RATES fx
+join DB_Data_Analytics_DEV.ED_DW.DIM_EXCHANGE_RATE_TYPE rt
+    on rt.exchangeratetypeid = fx.exchangeratetypeid
+join DB_Data_Analytics_DEV.ED_DW.DIM_CURRENCY tcur
+    on tcur.currencyid = fx.tocurrencyid
+where rt.exchangeratetype = 'Financial (Current)'
+),
+
+cte_premium_base as (
+    select
+        r.RiskReference,
+        r.RiskId,
+        cala.CalendarDate as AsAtDate,
+        sum(wp.OurShareGrossWrittenPremium * fx.rate_usd) as OurShareGrossWrittenPremium,
+        --expectedlossratiopercent: ExpectedClaimsCost / ELROurShareGrossWrittenPremium
+        sum(case when r.expectedlossratiopercent < 0.011 then 0.00 else wp.OurShareGrossWrittenPremium end * r.expectedlossratiopercent * fx.rate_usd) as ExpectedClaimsCost,
+        sum(case when r.expectedlossratiopercent < 0.011 then 0.00 else wp.OurShareGrossWrittenPremium end  * fx.rate_usd) as ELROurShareGrossWrittenPremium
+    from DB_Data_Analytics_DEV.ER_LEDGER.LEDGER_FACT_WRITTEN_PREMIUM wp
+    join DB_Data_Analytics_DEV.ED_DW.DIM_RISK r on r.RiskId = wp.RiskId
+    join DB_Data_Analytics_DEV.ED_DW.DIM_LINE_OF_BUSINESS lob on lob.LineOfBusinessId = r.LineOfBusinessId
+    join DB_Data_Analytics_DEV.ED_DW.DIM_CALENDAR cala on cala.DateId = wp.AsAtDateId
+    join DB_Data_Analytics_DEV.ED_DW.DIM_CALENDAR calt on calt.DateId = wp.TransactionDateId
+    join DB_Data_Analytics_DEV.ED_DW.DIM_CALENDAR calex on calex.DateId = r.ExpiryDateId
+    join DB_Data_Analytics_DEV.ED_DW.DIM_MARKET m on m.MarketId = r.MarketId
+    left join cte_exchange_rate fx
+      on fx.fromcurrencyid = wp.LedgerCurrencyId
+     and fx.reportingperiod = calt.yearmonthid
+    where r._SourceSystemCode = 'IRIS'
+      and r.RenewableIndicator = 'Yes'
+      and calex.Year >= 2013
+      and lob.Division in (
+          'Casualty Division','Energy Division','Financial Lines Division',
+          'Marine Division','Property Division','Speciality Division'
+      )
+      and not (r.underwritingmethod  in ('Declaration', 'Binder Declaration', 'Lineslip Declaration')
+            and r.facilitytype = 'Bulking Facility')
+    group by all
+),
+
+cte_premium as (
+
+    select
+        RiskReference,
+        RiskId,      -- picked from latest AsAtDate
+        AsAtDate,    -- latest AsAtDate
+        sum(OurShareGrossWrittenPremium) over (
+            partition by RiskReference
+        ) as OurShareGrossWrittenPremium,   -- not filtered to displayed RiskId
+       sum(ExpectedClaimsCost) over (
+            partition by RiskReference
+        ) as ExpectedClaimsCost,   -- not filtered to displayed RiskId 
+       sum(ELROurShareGrossWrittenPremium) over (
+            partition by RiskReference
+        ) as ELROurShareGrossWrittenPremium   -- not filtered to displayed RiskId        
+    from cte_premium_base
+    qualify row_number() over (
+        partition by RiskReference
+        order by AsAtDate desc, RiskId desc) = 1
+),
+
+cte_benchmark_premium as (
+select  
+r.riskreference,
+--lloydsbenchmarkpercent_ourshare: lloydsoursharegrosswrittenpremium_usd / lloydsoursharebenchmarkpremium_usd
+sum((bmp.lloydsoursharebenchmarkpremium * bmp.lloydsbenchmarkpercent * ifnull(fxcur.exchangerate, 1.000)))::decimal(18,4) as lloydsoursharegrosswrittenpremium,
+sum((bmp.lloydsoursharebenchmarkpremium * ifnull(fxcur.exchangerate, 1.000)))::decimal(18,4) as lloydsoursharebenchmarkpremium,
+--rocbenchmarkpercent_ourshare: rocoursharegrosswrittenpremium_usd / rocoursharebenchmarkpremium_usd
+sum((bmp.rocoursharebenchmarkpremium * bmp.rocbenchmarkpercent * ifnull(fxcur.exchangerate, 1.000)))::decimal(18,4) as rocoursharegrosswrittenpremium,
+sum((bmp.rocoursharebenchmarkpremium * ifnull(fxcur.exchangerate, 1.000)))::decimal(18,4) as rocoursharebenchmarkpremium,
+from DB_Data_Analytics_DEV.ED_DW.FACT_BENCHMARK_PREMIUM bmp
+join DB_Data_Analytics_DEV.ED_DW.DIM_RISK r on r.riskid = bmp.riskid
+join DB_Data_Analytics_DEV.ED_DW.DIM_LINE_OF_BUSINESS lob on lob.LineOfBusinessId = r.LineOfBusinessId
+join DB_Data_Analytics_DEV.ED_DW.DIM_CALENDAR calex on calex.DateId = r.ExpiryDateId
+left join cte_exchange_rate_current fxcur on fxcur.fromcurrencyid = bmp.accountingcurrencyid
+                                  and fxcur.tocurrencycode = 'USD'
+where r._SourceSystemCode = 'IRIS'
+  and r.RenewableIndicator = 'Yes'
+  and calex.Year >= 2013
+  and lob.Division in (
+      'Casualty Division','Energy Division','Financial Lines Division',
+      'Marine Division','Property Division','Speciality Division'
+  )  
+  and not (r.underwritingmethod  in ('Declaration', 'Binder Declaration', 'Lineslip Declaration')
+      and r.facilitytype = 'Bulking Facility')
+group by r.riskreference
+),
+
+
+
+risk_details as (
+    select 
+    case when r.underwritingmethod in ('Declaration', 'Binder Declaration', 'Lineslip Declaration') then left(prem.RiskReference,6) || substr(prem.RiskReference,10,6) ||  A.AssuredDescription
+         else left(prem.RiskReference,6) || substr(prem.RiskReference,10,5) end as RenewalGroupId,
+    lob.LineOfBusinessGroup,    
+    case when r.underwritingmethod in ('Binder', 'Lineslip') then 'Facility'
+         when r.underwritingmethod in ('Declaration', 'Binder Declaration', 'Lineslip Declaration') then 'Declaration'
+         else 'Open Market' end as UnderwritingGroup,
+    prem.RiskReference, 
+    null as RiskRef_Lowest,
+    null as UMRCount,
+    r.UMR,
+    m.Market,
+    1 as underlying_record_count,
+    lob.LineOfBusiness,    
+    A.AssuredDescription,
+    upper(A.AssuredDomicile) as AssuredDomicile,
+    cls.classdescription as Class,
+    cls.subclassdescription as SubClass,    
+    r.tradecodedescription,
+    calin.calendardate as InceptionDate,
+    calex.calendardate as ExpiryDate,
+    r.RenewableIndicator,
+    bk.TopBroker,
+    r.underwritername as Underwriter,
+    r.facilitytype,
+    r.leadfollow,
+    r.ShareSize,
+    r.slipleader,
+    tr.TerritoryDescription
+    from DB_Data_Analytics_DEV.ED_DW.DIM_RISK r
+    join cte_premium prem on prem.RiskId = r.RiskId
+    join DB_Data_Analytics_DEV.ED_DW.DIM_LINE_OF_BUSINESS lob on lob.LineOfBusinessId = r.LineOfBusinessId
+    join DB_Data_Analytics_DEV.ED_DW.DIM_MARKET m on m.marketid = r.marketid
+    join DB_Data_Analytics_DEV.ED_DW.DIM_ASSURED a on a.AssuredId = r.AssuredId
+    join DB_Data_Analytics_DEV.ED_DW.DIM_BROKER bk on bk.brokerid = r.brokerid
+    join DB_Data_Analytics_DEV.ED_DW.DIM_CLASS cls on cls.classid = r.classid
+    join DB_Data_Analytics_DEV.ED_DW.DIM_CALENDAR calin on calin.dateid = r.inceptiondateid
+    join DB_Data_Analytics_DEV.ED_DW.DIM_CALENDAR calex on calex.dateid = r.expirydateid
+    join DB_Data_Analytics_DEV.ED_DW.DIM_TERRITORY tr on tr.territoryid = r.territoryid 
+),
+
+risk_details_unique_key as (
+select  RenewalGroupId || '|' || LineOfBusinessGroup || '|' || UnderwritingGroup as UniqueRenewalGroupKey,
+        *
+from risk_details
+),
+
+unaggregated_view as (
+select rd.*, prem.OurShareGrossWrittenPremium::decimal(18,2) as OurShareGrossWrittenPremium, 
+        prem.ExpectedClaimsCost,
+        prem.ELROurShareGrossWrittenPremium,
+        (prem.ExpectedClaimsCost / nullif(prem.ELROurShareGrossWrittenPremium, 0) * 100)::decimal(18,2) as expectedlossratiopercent,
+        bmp.lloydsoursharegrosswrittenpremium,
+        bmp.lloydsoursharebenchmarkpremium,
+        (bmp.lloydsoursharegrosswrittenpremium / nullif(bmp.lloydsoursharebenchmarkpremium, 0) * 100)::decimal(18,2) as lloydsbenchmarkpercent,
+        bmp.rocoursharegrosswrittenpremium,
+        bmp.rocoursharebenchmarkpremium,
+        (bmp.rocoursharegrosswrittenpremium / nullif(bmp.rocoursharebenchmarkpremium, 0) * 100)::decimal(18,2) as rocbenchmarkpercent
+from risk_details_unique_key rd
+left join cte_premium prem on prem.riskreference = rd.riskreference
+left join cte_benchmark_premium bmp on bmp.riskreference = rd.riskreference
+where (rd.UnderwritingGroup != 'Facility' AND prem.OurShareGrossWrittenPremium >= 1)
+       OR rd.UnderwritingGroup = 'Facility'
+),
+
+
+ranked_unaggregated_view as (
+    select
+        src.*,
+        row_number() over (
+            partition by
+                uniquerenewalgroupkey,
+                renewalgroupid,
+                lineofbusinessgroup,
+                underwritinggroup
+            order by riskreference asc
+        ) as rn
+    from unaggregated_view src
+),
+
+aggregated_inception_expiry as (
+    select RenewalGroupId,
+           min(InceptionDate) as InceptionDate,
+           max(ExpiryDate) as ExpiryDate
+    from unaggregated_view
+    group by RenewalGroupId
+),
+
+
+aggregated_view as (
+    select
+        uniquerenewalgroupkey,
+        ruvw.renewalgroupid,
+        lineofbusinessgroup,
+        underwritinggroup,
+        null as RiskReference,
+        max(case when rn = 1 then RiskReference end) as RiskRef_Lowest,
+        count(distinct UMR) as UMRCount,   
+        listagg(distinct UMR, '; ') within group (order by UMR) as UMR,
+        listagg(distinct Market, '; ') within group (order by Market) as Market,
+        count(distinct riskreference) as underlying_record_count,
+        max(case when rn = 1 then LineOfBusiness end) as LineOfBusiness,
+        max(case when rn = 1 then AssuredDescription end) as AssuredDescription,
+        max(case when rn = 1 then AssuredDomicile end) as AssuredDomicile,
+        max(case when rn = 1 then Class end) as Class,
+        max(case when rn = 1 then SubClass end) as SubClass,
+        max(case when rn = 1 then TradeCodeDescription end) as TradeCodeDescription,
+        inex.InceptionDate as InceptionDate,
+        inex.ExpiryDate as ExpiryDate,
+        max(case when rn = 1 then RenewableIndicator end) as RenewableIndicator,
+        max(case when rn = 1 then TopBroker end) as TopBroker,
+        max(case when rn = 1 then Underwriter end) as Underwriter,       
+        max(case when rn = 1 then FacilityType end) as FacilityType,
+        max(case when rn = 1 then LeadFollow end) as LeadFollow,
+        max(case when rn = 1 then ShareSize end) as ShareSize,
+        max(case when rn = 1 then SlipLeader end) as SlipLeader,
+        max(case when rn = 1 then TerritoryDescription end) as TerritoryDescription,
+        sum(OurShareGrossWrittenPremium)::decimal(18,2) as OurShareGrossWrittenPremium,
+        sum(ExpectedClaimsCost) as ExpectedClaimsCost,
+        sum(ELROurShareGrossWrittenPremium) as ELROurShareGrossWrittenPremium,
+        (sum(ExpectedClaimsCost) / nullif(sum(ELROurShareGrossWrittenPremium), 0) * 100)::decimal(18,2) as expectedlossratiopercent,
+        sum(lloydsoursharegrosswrittenpremium) as lloydsoursharegrosswrittenpremium,
+        sum(lloydsoursharebenchmarkpremium) as lloydsoursharebenchmarkpremium,
+        (sum(lloydsoursharegrosswrittenpremium) / nullif(sum(lloydsoursharebenchmarkpremium), 0) * 100)::decimal(18,2) as lloydsbenchmarkpercent,
+        sum(rocoursharegrosswrittenpremium) as rocoursharegrosswrittenpremium,
+        sum(rocoursharebenchmarkpremium) as rocoursharebenchmarkpremium,
+        (sum(rocoursharegrosswrittenpremium) / nullif(sum(rocoursharebenchmarkpremium), 0) * 100)::decimal(18,2) as rocbenchmarkpercent
+    from ranked_unaggregated_view ruvw
+    join aggregated_inception_expiry inex on inex.renewalgroupid = ruvw.renewalgroupid
+    where inex.ExpiryDate >= '2026-01-01'
+    group by
+        uniquerenewalgroupkey,
+        ruvw.renewalgroupid,
+        lineofbusinessgroup,
+        underwritinggroup,
+        inex.InceptionDate,
+        inex.ExpiryDate
+        
+),
+
+final_view as (
+select 'AGGREGATED' as view_type, * exclude (ExpectedClaimsCost, ELROurShareGrossWrittenPremium, lloydsoursharegrosswrittenpremium, lloydsoursharebenchmarkpremium, rocoursharegrosswrittenpremium, rocoursharebenchmarkpremium) from aggregated_view
+union all
+select 'UNAGGREGATED' as view_type, uv.* exclude (ExpectedClaimsCost, ELROurShareGrossWrittenPremium, lloydsoursharegrosswrittenpremium, lloydsoursharebenchmarkpremium, rocoursharegrosswrittenpremium, rocoursharebenchmarkpremium) 
+from unaggregated_view uv 
+where uv.renewalgroupid in (select distinct renewalgroupid from aggregated_view)
+)
+
+select * from final_view
+;

@@ -1,0 +1,339 @@
+create or replace view DB_LM_SUBMISSION_PIPELINE_DEV.SUBMISSION_PIPELINE.VW_SUBMISSION_PIPELINE(
+	"Submission ID",
+	"Submission Reference",
+	"Insured Name (mapped into account name)",
+	"Estimated NAICS Code",
+	"Estimated SIC Code",
+	"SICCodeDescription",
+	"Insured Address Line 1",
+	"Insured Address Line 2",
+	"Insured Address City",
+	"Insured Address State",
+	"Insured Address Country (mapped to country)",
+	"Insured Address Postal / ZIP code",
+	"Broker Group",
+	"Broker",
+	"Broker Contact",
+	"Broker Contact Email",
+	"Submission Received Date",
+	"Coverholder Name (mapped back to account name)",
+	"Lineslip Broker (mapped back to account name)",
+	"Consortia Lead (mapped back to account name)",
+	"Facility Name",
+	"Risk Name",
+	"Inception Date",
+	"Expiry Date",
+	"Underwriter Name",
+	"New/Renewal Indicator",
+	"Coverholder HQ Country (mapped to country)",
+	"Coverholder HQ State (if applicable)",
+	"Lineslip Broker HQ Country (mapped to country)",
+	"Lineslip Broker HQ State (if applicable)",
+	"Consortia Lead HQ Country (mapped to country)",
+	"Consortia Lead HQ State (if applicable)",
+	"Business Type",
+	"Account Name Type",
+	"Account Name",
+	"Parent Facility Name (if applicable)",
+	"Lead/Follow/Lead&amp;amp;amp;Follow",
+	"Primary/Excess/Primary&amp;amp;amp;Excess",
+	"Status",
+	"Territorial Limit",
+	"Risk Summary (AI Summary)",
+	"Arch LoB",
+	"Trade Code/Sector",
+	"TradeCodeDescription",
+	"Branch Code",
+	"BranchCodeDescription",
+	"Class Code",
+	"ClassCodeDescription",
+	"Section Code",
+	"Linked Renewal Group ID",
+	"Linked Renewal Group List",
+	"Linked Master Facility ID",
+	"Ingestion ID",
+	"NTU/Decline reason"
+) as
+
+WITH submission_roles AS (
+    SELECT
+        spr."SubmissionID",
+        MAX(CASE WHEN LOWER(r."Role") IN ('insured','account') THEN spr."PartyID" END) AS insured_party_id,
+        MAX(CASE WHEN LOWER(r."Role") = 'coverholder' THEN spr."PartyID" END) AS coverholder_party_id,
+        MAX(CASE WHEN LOWER(r."Role") IN ('lineslip broker','line slip broker') THEN spr."PartyID" END) AS lineslip_broker_party_id,
+        MAX(CASE WHEN LOWER(r."Role") IN ('insured','account') THEN p."PartyName" END) AS insured_name,
+        MAX(CASE WHEN LOWER(r."Role") = 'broker' THEN p."PartyName" END) AS broker_name,
+        MAX(CASE WHEN LOWER(r."Role") = 'broker group' THEN p."PartyName" END) AS broker_group_name,
+        MAX(CASE WHEN LOWER(r."Role") = 'coverholder' THEN p."PartyName" END) AS coverholder_name,
+        MAX(CASE WHEN LOWER(r."Role") IN ('lineslip broker','line slip broker') THEN p."PartyName" END) AS lineslip_broker_name,
+        MAX(CASE WHEN LOWER(r."Role") = 'underwriter' THEN p."PartyName" END) AS underwriter_name,
+        MAX(CASE WHEN LOWER(r."Role") = 'broker' THEN parent_p."PartyName" END) AS broker_parent_name
+    FROM DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."SubmissionPartyRole" spr
+    JOIN DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."Role" r
+        ON spr."RoleID" = r."RoleID"
+    JOIN DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."Party" p
+        ON spr."PartyID" = p."PartyID"
+    LEFT JOIN DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."Party" parent_p
+        ON p."ParentPartyID" = parent_p."PartyID"
+    GROUP BY spr."SubmissionID"
+),
+
+consortia_lead AS (
+    SELECT
+        cm."SubmissionID",
+        MAX(cm."PartyID") AS consortia_lead_party_id,
+        MAX(p."PartyName") AS consortia_lead_name
+    FROM DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."ConsortiumMembership" cm
+    JOIN DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."Party" p
+        ON cm."PartyID" = p."PartyID"
+    WHERE cm."LeadFollow" ILIKE 'lead%'
+    GROUP BY cm."SubmissionID"
+),
+
+submission_lens_links AS (
+    SELECT 
+        sub."SubmissionNumber" AS "SubmissionNumber",
+        MAX(rg."RenewalGroupId") AS linked_renewal_group_id,
+        LISTAGG(DISTINCT rg."RenewalGroupId", '¬¬¬') AS linked_renewal_groups_list,
+        MAX(rf."IrisPolicyReference") AS linked_master_facility_id
+    FROM DB_LM_INGESTION_CDC_RAW_UAT."IngestionManagement"."Submission" sub
+    LEFT JOIN DB_LM_INGESTION_CDC_RAW_UAT."IngestionManagement"."SubmissionRenewalGroupLink" rg
+        ON sub."SubmissionKey" = rg."SubmissionKey"
+    LEFT JOIN DB_LM_INGESTION_CDC_RAW_UAT."IngestionManagement"."SubmissionFacilityLink" rf
+        ON sub."SubmissionKey" = rf."SubmissionKey"
+    GROUP BY sub."SubmissionNumber"
+),
+
+submission_ingestion AS (
+    SELECT
+        sim."SubmissionID",
+        MAX(sim."IngestionSubmissionID") AS ingestion_id
+    FROM DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."SubmissionIngestionMap" sim
+    GROUP BY sim."SubmissionID"
+),
+
+party_scope AS (
+    SELECT insured_party_id AS "PartyID"
+    FROM submission_roles
+    WHERE insured_party_id IS NOT NULL
+
+    UNION
+
+    SELECT coverholder_party_id
+    FROM submission_roles
+    WHERE coverholder_party_id IS NOT NULL
+
+    UNION
+
+    SELECT lineslip_broker_party_id
+    FROM submission_roles
+    WHERE lineslip_broker_party_id IS NOT NULL
+
+    UNION
+
+    SELECT consortia_lead_party_id
+    FROM consortia_lead
+    WHERE consortia_lead_party_id IS NOT NULL
+),
+
+party_current_address AS (
+    SELECT
+        pa."PartyID",
+        a."Address1",
+        a."Address2",
+        a."State",
+        a."Country",
+        a."ZipPostCode"
+    FROM DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."PartyAddress" pa
+    JOIN party_scope ps
+        ON pa."PartyID" = ps."PartyID"
+    JOIN DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."Address" a
+        ON pa."AddressID" = a."AddressID"
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY pa."PartyID"
+        ORDER BY pa."EffectiveDate" DESC
+    ) = 1
+),
+
+party_hq_address AS (
+    SELECT
+        pa."PartyID",
+        a."Country",
+        a."State"
+    FROM DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."PartyAddress" pa
+    JOIN party_scope ps
+        ON pa."PartyID" = ps."PartyID"
+    JOIN DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."Address" a
+        ON pa."AddressID" = a."AddressID"
+    WHERE LOWER(COALESCE(a."AddressUsage",'')) LIKE '%hq%'
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY pa."PartyID"
+        ORDER BY pa."EffectiveDate" DESC
+    ) = 1
+),
+
+TRADECODE AS
+(select 
+concat(trim(TDTJRD), trim(TDTDCD)) as "Key",
+trim(tdtdsd) as "ShortDescription", 
+trim(tdtdds) as "Description",
+trim(tdbhrd) as "BranchCode",
+trim(tdcbrd) as "ClassCode",
+case when x.tdrcfd <> 'D' then FALSE else TRUE end as "IsDeleted",
+case 
+when concat(trim(TDTJRD), trim(TDTDCD)) = 'HHA' and trim(tdcbrd) = 'RL' then 'E3'
+when concat(trim(TDTJRD), trim(TDTDCD)) = 'HHB' and trim(tdcbrd) = 'RL' then 'E5'
+when concat(trim(TDTJRD), trim(TDTDCD)) in ('HHC','HHD') and trim(tdcbrd) = 'SA' then 'E7' 
+when concat(trim(TDTJRD), trim(TDTDCD)) in ('HHE','HHG','HHH','HHJ','HHF') and trim(tdcbrd) = 'TM' then 'E9' 
+else NULL end 
+as "DefaultRiskCode",
+case when trim(tdbhrd) in ('RB','RC','RJ','RK','RM','RN','RX','RP') then true else false end as "IsReinsurance"
+from PROD_IRIS_A_RAW.XUNMDTAAIE.UCTDREP x),
+
+BRANCHCODE AS
+(select 
+trim(bhbhcd) as "Key", 
+trim(bhbhsd) as "ShortDescription", 
+trim(bhbhds) as "Description",
+case when trim(bhbhcd) in ('4','5','L','V','W','7','IA') then true else false end as "SectionRequired",
+case when trim(bhbhcd) in ('8','9','IA') then 'PL' else null end as "DefaultSectionCode",
+case when trim(bhbhcd) in ('8','9','IA') then 'PL' else null end as "DefaultSectionDivision",
+case when x.bhrcfd <> 'D' then FALSE else TRUE end as "IsDeleted",
+case when trim(bhbhcd) in ('RB','RC','RJ','RK','RM','RN','RX','RV','RG','RP') then true else false end as "IsReinsurance"
+from PROD_IRIS_A_RAW.XUNMDTAAIE.UCBHREP x 
+where trim(bhbhcd) not in ('2') and not (LENGTH(trim(bhbhcd)) = 2 and startswith(trim(bhbhcd), 'Q'))),
+
+CLASSCODE AS
+(select 
+trim(cbcbcd) as "Key", 
+trim(cbcbsd) as "ShortDescription", 
+trim(cbcbds) as "Description",
+trim(cbbhrd) as "BranchCode",
+case when x.cbrcfd <> 'D' then FALSE else TRUE end as "IsDeleted",
+case when trim(cbbhrd) in ('RB','RC','RJ','RK','RM','RN','RX','RV','RG','RP') then true else false end as "IsReinsurance",
+case when trim(cbcbcd) in ('FK','MD','MG','MI','MO','MT','AH','AM','AT','BG','BR','CW') then '1LOW' else null end as "DefaultConductRisk"
+from PROD_IRIS_A_RAW.XUNMDTAAIE.UCCBREP x 
+where trim(cbbhrd) not in ('2') and not (LENGTH(trim(cbcbcd)) = 3 and startswith(trim(cbcbcd), 'Q'))),
+
+SICCODE AS
+(SELECT
+    TRIM(X1PC01)          AS "Key",
+    TRIM(UPPER(X1PCSD))   AS "ShortDescription",
+    TRIM(UPPER(X1PCDS))   AS "Description",
+    CASE WHEN x.X1RCFD <> 'D' THEN FALSE ELSE TRUE END AS "IsDeleted"
+FROM PROD_IRIS_A_RAW.XUNMDTAAIE.UCX1REP x),
+
+SUBMISSIONPARTYROLES AS
+(SELECT PR."SubmissionID",
+R."Role",
+P."PartyName"
+FROM DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."SubmissionPartyRole" AS PR
+LEFT JOIN DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."Role" AS R
+ON PR."RoleID" = R."RoleID"
+LEFT JOIN DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."Party" AS P
+ON PR."PartyID" = P."PartyID")
+
+SELECT
+    s."SubmissionID" AS "Submission ID",
+    s."SubmissionReference" AS "Submission Reference",
+    sr.insured_name,
+    s."EstimatedNAICCode",
+    s."EstimatedSICCode",
+    SC."Description" AS "SICCodeDescription",
+    insured_addr."Address1",
+    insured_addr."Address2",
+    NULL,
+    insured_addr."State",
+    insured_addr."Country",
+    insured_addr."ZipPostCode",
+    COALESCE(sr.broker_group_name, sr.broker_parent_name),
+    sr.broker_name,
+    s."BrokerContact",
+    s."BrokerContactEmail",
+    s."SubmissionReceivedDate",
+    sr.coverholder_name,
+    sr.lineslip_broker_name,
+    cl.consortia_lead_name,
+    s."FacilityName",
+    rk."RiskName",
+    s."InceptionDate",
+    s."ExpiryDate",
+    sr.underwriter_name,
+    s."NewRenewal",
+    coverholder_hq."Country",
+    coverholder_hq."State",
+    lineslip_hq."Country",
+    lineslip_hq."State",
+    consortia_hq."Country",
+    consortia_hq."State",
+    s."BusinessType",
+    CASE
+    WHEN s."BusinessType" = 'Open Market' THEN 'Insured'
+    WHEN s."BusinessType" = 'Binding Authority' THEN 'Coverholder'
+    WHEN s."BusinessType" = 'Lineslip' THEN 'Lineslip Broker'
+    WHEN s."BusinessType" = 'Declaration' THEN 'Insured'
+    WHEN s."BusinessType" = 'Consortia' THEN 'Consortia Lead'
+    ELSE null
+    END AS "Account Name Type",
+    PR."PartyName" AS "Account Name",
+    NULL,
+    s."LeadFollowBoth",
+    s."PrimaryExcessBoth",
+    ss."SubmissionStatus",
+    s."TerritorialLimit",
+    s."RiskSummary",
+    s."LineOfBusiness",
+    s."TradeCode",
+    TC."Description" AS "TradeCodeDescription",
+    s."BranchCode",
+    BC."Description" AS "BranchCodeDescription",
+    s."ClassCode",
+    CC."Description" AS "ClassCodeDescription",
+    s."SectionCode",
+    sll.linked_renewal_group_id,
+    sll.linked_renewal_groups_list,
+    sll.linked_master_facility_id,
+    si.ingestion_id,
+    s."NTUDeclineReason"
+
+FROM DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."Submission" s
+LEFT JOIN submission_roles sr
+    ON s."SubmissionID" = sr."SubmissionID"
+LEFT JOIN consortia_lead cl
+    ON s."SubmissionID" = cl."SubmissionID"
+LEFT JOIN DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."Risk" rk
+    ON s."RiskID" = rk."RiskID"
+LEFT JOIN DB_LM_LENS_LENSWORKFLOW_CDC_RAW_UAT.LM."SubmissionStatus" ss
+    ON s."SubmissionStatusID" = ss."SubmissionStatusID"
+LEFT JOIN submission_lens_links sll
+    ON SUBSTRING(s."SubmissionReference", 4) = sll."SubmissionNumber"
+LEFT JOIN submission_ingestion si
+    ON s."SubmissionID" = si."SubmissionID"
+LEFT JOIN party_current_address insured_addr
+    ON sr.insured_party_id = insured_addr."PartyID"
+LEFT JOIN party_hq_address coverholder_hq
+    ON sr.coverholder_party_id = coverholder_hq."PartyID"
+LEFT JOIN party_hq_address lineslip_hq
+    ON sr.lineslip_broker_party_id = lineslip_hq."PartyID"
+LEFT JOIN party_hq_address consortia_hq
+    ON cl.consortia_lead_party_id = consortia_hq."PartyID"
+LEFT JOIN TRADECODE AS TC
+    ON s."TradeCode" = TC."Key"
+    AND s."BranchCode" = TC."BranchCode"
+    AND s."ClassCode" = TC."ClassCode"
+LEFT JOIN BRANCHCODE AS BC
+    ON s."BranchCode" = BC."Key"
+LEFT JOIN CLASSCODE AS CC
+    ON s."ClassCode" = CC."Key"
+    AND s."BranchCode" = CC."BranchCode"
+LEFT JOIN SICCODE AS SC
+    ON s."EstimatedSICCode" = SC."Key"
+LEFT JOIN SUBMISSIONPARTYROLES AS PR
+    ON s."SubmissionID" = PR."SubmissionID"
+    AND "Account Name Type" = PR."Role"
+
+    
+    
+    
+    
+    ;
